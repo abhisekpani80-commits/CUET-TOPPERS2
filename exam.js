@@ -1,333 +1,505 @@
-/* ───────────────────────────────────────────
-   LOGIN PAGE STYLES
-   ─────────────────────────────────────────── */
+/**
+ * CUET CBT Mock Test — Exam Engine
+ * Handles: timer, question navigation, palette state machine,
+ *          auto-save, session persistence, submit logic
+ */
 
-body {
-    background: linear-gradient(135deg, #001f5c 0%, #003087 60%, #1a4ba0 100%);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let state = {
+    user: null,
+    testId: null,
+    test: null,
+    questions: [],
+    currentIndex: 0,
+    answers: {},          // { questionId: { selectedAnswer, status, markedForReview, timeSpent, savedAt } }
+    timeRemaining: 0,     // seconds
+    sessionId: null,
+    attemptNumber: 1,
+    startedAt: null,
+    submitted: false,
+    qTimerSeconds: 0,     // per-question timer
+};
+
+let timerInterval = null;
+let qTimerInterval = null;
+let autoSaveInterval = null;
+let beepPlayed10 = false;
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', init);
+
+async function init() {
+    // Auth check
+    state.user = requireAuth();
+    if (!state.user) return;
+
+    // Get test ID
+    state.testId = Store.get('activeTestId', 'MOCK001');
+    state.test = TEST_LIST.find(t => t.id === state.testId);
+    if (!state.test) { window.location.href = 'dashboard.html'; return; }
+
+    // Access check
+    if (!isTestUnlocked(state.user.rollNumber, state.testId)) {
+        alert('You do not have access to this test. Please unlock it first.');
+        window.location.href = 'dashboard.html';
+        return;
+    }
+
+    // Load or create session
+    const fresh = Store.get('examStartFresh', false);
+    const savedSession = Store.get(`session_${state.user.rollNumber}_${state.testId}`);
+
+    if (!fresh && savedSession && savedSession.submitted === false) {
+        // Resume session
+        Object.assign(state, savedSession);
+        Store.remove('examStartFresh');
+    } else {
+        // New session
+        Store.remove('examStartFresh');
+
+        // Phase 8: Fetch from Cloud first, fallback to Local
+        state.questions = await fetchLiveQuestions(state.testId);
+        if (!state.questions || state.questions.length === 0) {
+            state.questions = getQuestionsForTest(state.testId);
+        }
+
+        state.currentIndex = 0;
+        state.timeRemaining = state.test.durationMinutes * 60;
+        state.sessionId = 'SES_' + Date.now();
+        state.attemptNumber = getNextAttemptNumber();
+        state.startedAt = nowISO();
+        state.submitted = false;
+        state.answers = {};
+        state.beepPlayed10 = false;
+        // Initialize all questions as not-visited
+        state.questions.forEach(q => {
+            state.answers[q.id] = {
+                selectedAnswer: null,
+                status: 'not-visited',
+                markedForReview: false,
+                timeSpent: 0,
+                savedAt: null
+            };
+        });
+    }
+
+    // Render UI
+    renderHeader();
+    renderSectionTabs();
+    renderPalette();
+    goToQuestion(state.currentIndex);
+
+    // Start timers
+    startGlobalTimer();
+    startQTimer();
+
+    // Auto-save every 30s
+    autoSaveInterval = setInterval(saveSession, 30000);
+
+    // Browser back-button warning
+    window.history.pushState(null, '', window.location.href);
+    window.addEventListener('popstate', function () {
+        window.history.pushState(null, '', window.location.href);
+        showToast('⚠️ Browser back button is disabled during the exam.', 'warning');
+    });
+
+    // Prevent page unload without warning
+    window.addEventListener('beforeunload', function (e) {
+        if (!state.submitted) {
+            saveSession();
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
 }
 
-/* ─── HEADER ─── */
-.login-header {
-    background: rgba(0, 0, 0, 0.25);
-    backdrop-filter: blur(10px);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 12px 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
+// ─── GET NEXT ATTEMPT NUMBER ─────────────────────────────────────────────────
+function getNextAttemptNumber() {
+    const all = Store.get('allScores', []);
+    const prev = all.filter(s => s.testId === state.testId && s.userId === state.user.rollNumber);
+    return prev.length + 1;
 }
 
-.header-brand {
-    display: flex;
-    align-items: center;
-    gap: 16px;
+// ─── RENDER HEADER ───────────────────────────────────────────────────────────
+function renderHeader() {
+    document.getElementById('candName').textContent = state.user.name;
+    document.getElementById('candRoll').textContent = 'Roll: ' + state.user.rollNumber;
+    document.getElementById('candPhoto').textContent =
+        state.user.name.split(' ').slice(0, 2).map(w => w[0]).join('').toUpperCase();
 }
 
-.nta-emblem {
-    width: 52px;
-    height: 52px;
-    background: #fff;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 10px;
-    font-weight: 900;
-    color: var(--nta-navy);
-    text-align: center;
-    line-height: 1.1;
-    padding: 4px;
-    flex-shrink: 0;
+// ─── SECTION TABS ─────────────────────────────────────────────────────────────
+function renderSectionTabs() {
+    const tabs = document.getElementById('sectionTabs');
+    // For this demo, single section
+    tabs.innerHTML = `<button class="section-tab active" aria-current="true">${state.test.section}</button>
+  <button class="section-tab" onclick="showToast('Additional sections available in full version','info')">Section IA — Languages</button>`;
 }
 
-.header-title {
-    color: #fff;
+// ─── RENDER PALETTE ───────────────────────────────────────────────────────────
+function renderPalette() {
+    const grid = document.getElementById('paletteGrid');
+    grid.innerHTML = state.questions.map((q, i) => {
+        const ans = state.answers[q.id] || {};
+        const palState = getPaletteClass(ans.status, ans.markedForReview, ans.selectedAnswer);
+        const isCurrent = i === state.currentIndex;
+        return `<button
+      class="palette-btn ${palState}${isCurrent ? ' current' : ''}"
+      onclick="jumpToQuestion(${i})"
+      title="Q${q.questionNumber}: ${ans.status.replace(/-/g, ' ')}"
+      aria-label="Question ${q.questionNumber}"
+      aria-pressed="${isCurrent}">${q.questionNumber}</button>`;
+    }).join('');
+
+    updateSummary();
 }
 
-.header-title h1 {
-    font-size: 17px;
-    font-weight: 700;
-    line-height: 1.2;
-    letter-spacing: 0.3px;
+function getPaletteClass(status, markedForReview, selectedAnswer) {
+    if (status === 'not-visited') return 'p-not-visited';
+    if (markedForReview && selectedAnswer) return 'p-answered-marked';
+    if (markedForReview) return 'p-marked-no-ans';
+    if (selectedAnswer) return 'p-answered';
+    return 'p-not-answered';
 }
 
-.header-title p {
-    font-size: 12px;
-    opacity: 0.75;
-    margin-top: 2px;
+function updateSummary() {
+    let answered = 0, notAnswered = 0, marked = 0, notVisited = 0;
+    Object.values(state.answers).forEach(a => {
+        const cls = getPaletteClass(a.status, a.markedForReview, a.selectedAnswer);
+        if (cls === 'p-answered' || cls === 'p-answered-marked') answered++;
+        else if (cls === 'p-not-answered') notAnswered++;
+        else if (cls === 'p-marked-no-ans') marked++;
+        else notVisited++;
+    });
+    document.getElementById('sumAnswered').textContent = answered;
+    document.getElementById('sumNotAnswered').textContent = notAnswered;
+    document.getElementById('sumMarked').textContent = marked;
+    document.getElementById('sumNotVisited').textContent = notVisited;
 }
 
-.lang-toggle-header {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 20px;
-    padding: 4px;
+// ─── NAVIGATE QUESTIONS ───────────────────────────────────────────────────────
+function goToQuestion(index) {
+    if (index < 0 || index >= state.questions.length) return;
+
+    // Save current question's per-Q time
+    if (qTimerInterval) {
+        clearInterval(qTimerInterval);
+        state.answers[state.questions[state.currentIndex].id].timeSpent += state.qTimerSeconds;
+    }
+
+    state.currentIndex = index;
+    const q = state.questions[index];
+    const ans = state.answers[q.id] || {};
+
+    // Mark as visited (not-answered) if first time
+    if (ans.status === 'not-visited') {
+        state.answers[q.id].status = 'not-answered';
+    }
+
+    // Reset per-question timer
+    state.qTimerSeconds = 0;
+    startQTimer();
+
+    // Render question
+    document.getElementById('questionBadge').textContent = `Question ${q.questionNumber} of ${state.questions.length}`;
+    document.getElementById('questionText').textContent = q.questionText;
+    document.getElementById('topicBadge').textContent = q.topic;
+
+    const diffEl = document.getElementById('diffBadge');
+    diffEl.textContent = q.difficulty.charAt(0).toUpperCase() + q.difficulty.slice(1);
+    diffEl.className = `diff-badge diff-${q.difficulty}`;
+
+    renderOptions(q, state.answers[q.id]);
+    renderPalette();
+    checkAttemptLimit();
+
+    // Scroll to top
+    document.getElementById('questionContent').scrollTop = 0;
 }
 
-.lang-btn {
-    background: transparent;
-    border: none;
-    color: rgba(255, 255, 255, 0.7);
-    padding: 4px 12px;
-    border-radius: 16px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s;
-    font-family: var(--font-primary);
+function renderOptions(q, ans) {
+    const selected = ans?.selectedAnswer;
+    const list = document.getElementById('optionsList');
+    list.innerHTML = Object.entries(q.options).map(([key, text]) => `
+    <div class="option-item${selected === key ? ' selected' : ''}"
+      onclick="selectOption('${q.id}', '${key}')"
+      tabindex="0"
+      role="radio"
+      aria-checked="${selected === key}"
+      aria-label="Option ${key}: ${text}"
+      onkeydown="if(event.key==='Enter'||event.key===' '){selectOption('${q.id}','${key}')}">
+      <div class="option-radio"></div>
+      <span class="option-label">${key}</span>
+      <span class="option-text">${text}</span>
+    </div>`).join('');
 }
 
-.lang-btn.active {
-    background: #fff;
-    color: var(--nta-navy);
+// ─── SELECT OPTION ─────────────────────────────────────────────────────────────
+function selectOption(qId, optionKey) {
+    const ans = state.answers[qId];
+    if (!ans) return;
+
+    // Check attempt limit
+    const attemptLimit = state.test.attemptLimit;
+    const answeredCount = Object.values(state.answers).filter(a => a.selectedAnswer).length;
+    if (!ans.selectedAnswer && answeredCount >= attemptLimit) {
+        showToast(`⚠️ Attempt limit reached! You can attempt only ${attemptLimit} questions. Deselect one first.`, 'warning', 4000);
+        return;
+    }
+
+    // Toggle deselect
+    if (ans.selectedAnswer === optionKey) {
+        ans.selectedAnswer = null;
+    } else {
+        ans.selectedAnswer = optionKey;
+    }
+
+    // Re-render options
+    renderOptions(state.questions[state.currentIndex], ans);
+    checkAttemptLimit();
 }
 
-/* ─── MAIN CONTENT ─── */
-.login-main {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 32px 16px;
+// ─── CHECK ATTEMPT LIMIT ──────────────────────────────────────────────────────
+function checkAttemptLimit() {
+    const answeredCount = Object.values(state.answers).filter(a => a.selectedAnswer).length;
+    const limitReached = answeredCount >= state.test.attemptLimit;
+    const currentHasAnswer = !!state.answers[state.questions[state.currentIndex].id]?.selectedAnswer;
+    const warning = document.getElementById('attemptWarning');
+    if (limitReached && !currentHasAnswer) {
+        warning.classList.add('show');
+    } else {
+        warning.classList.remove('show');
+    }
 }
 
-.login-card {
-    background: #fff;
-    border-radius: 12px;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-    width: 100%;
-    max-width: 440px;
-    overflow: hidden;
+// ─── ACTION BUTTONS ───────────────────────────────────────────────────────────
+function saveAndNext() {
+    const q = state.questions[state.currentIndex];
+    const ans = state.answers[q.id];
+
+    if (ans.selectedAnswer) {
+        ans.status = 'saved';
+        ans.savedAt = nowISO();
+    } else {
+        ans.status = 'not-answered';
+    }
+    // Clear marked flag when saving directly
+    // (only markForReview sets markedForReview)
+    saveSession();
+    navigateQuestion(1);
 }
 
-.login-card-header {
-    background: linear-gradient(135deg, var(--nta-navy) 0%, #1a4ba0 100%);
-    padding: 24px 28px;
-    color: #fff;
-    text-align: center;
-    border-bottom: 3px solid var(--nta-saffron);
+function markForReview() {
+    const q = state.questions[state.currentIndex];
+    const ans = state.answers[q.id];
+    ans.markedForReview = true;
+    if (ans.selectedAnswer) {
+        ans.status = 'saved';
+    } else {
+        ans.status = 'not-answered';
+    }
+    saveSession();
+    navigateQuestion(1);
 }
 
-.login-card-header .cuet-logo {
-    font-size: 28px;
-    font-weight: 900;
-    letter-spacing: 2px;
-    margin-bottom: 4px;
+function clearResponse() {
+    const q = state.questions[state.currentIndex];
+    const ans = state.answers[q.id];
+    ans.selectedAnswer = null;
+    ans.markedForReview = false;
+    if (ans.status !== 'not-visited') ans.status = 'not-answered';
+    renderOptions(q, ans);
+    renderPalette();
+    checkAttemptLimit();
 }
 
-.login-card-header .cuet-sub {
-    font-size: 12px;
-    opacity: 0.8;
-    letter-spacing: 1px;
+function navigateQuestion(delta) {
+    const next = state.currentIndex + delta;
+    if (next >= 0 && next < state.questions.length) {
+        goToQuestion(next);
+    } else if (next >= state.questions.length) {
+        showToast('You are on the last question.', 'info');
+    } else {
+        showToast('You are on the first question.', 'info');
+    }
 }
 
-.login-card-body {
-    padding: 28px;
+function jumpToQuestion(index) {
+    // Jump does NOT save current answer
+    goToQuestion(index);
 }
 
-.login-card-body h2 {
-    font-size: 16px;
-    font-weight: 700;
-    color: var(--nta-navy);
-    margin-bottom: 20px;
-    text-align: center;
-    border-bottom: 1px solid var(--divider);
-    padding-bottom: 12px;
+// ─── FONT SIZE ────────────────────────────────────────────────────────────────
+function setFontSize(size) {
+    document.body.classList.remove('font-small', 'font-medium', 'font-large');
+    document.body.classList.add(`font-${size}`);
+    Store.set('fontSize', size);
 }
 
-/* ─── INPUT GROUPS ─── */
-.input-icon-wrap {
-    position: relative;
+// ─── GLOBAL TIMER ─────────────────────────────────────────────────────────────
+function startGlobalTimer() {
+    updateTimerDisplay();
+    timerInterval = setInterval(() => {
+        state.timeRemaining--;
+        updateTimerDisplay();
+
+        // 10-minute warning
+        if (state.timeRemaining === 600 && !beepPlayed10) {
+            beepPlayed10 = true;
+            playBeep(440, 0.3);
+            showToast('⏱ 10 minutes remaining!', 'warning');
+        }
+        // 5-minute warning
+        if (state.timeRemaining === 300) {
+            document.getElementById('timerBox').classList.add('warning');
+            showToast('🚨 Only 5 minutes left! Speed up!', 'error');
+            playBeep(880, 0.5);
+        }
+        // 1-minute warning
+        if (state.timeRemaining === 60) {
+            showToast('⚠️ 1 minute remaining! Auto-submit soon.', 'error');
+            playBeep(1100, 0.7);
+        }
+        // Auto-submit
+        if (state.timeRemaining <= 0) {
+            clearInterval(timerInterval);
+            showToast('⏰ Time is up! Submitting your exam...', 'error', 3000);
+            setTimeout(finalSubmit, 1500);
+        }
+
+        // Save every 30s (also handled by autoSaveInterval, but sync timer)
+        if (state.timeRemaining % 30 === 0) saveSession();
+    }, 1000);
 }
 
-.input-icon-wrap .icon {
-    position: absolute;
-    left: 12px;
-    top: 50%;
-    transform: translateY(-50%);
-    font-size: 15px;
-    pointer-events: none;
-    color: #9E9E9E;
+function updateTimerDisplay() {
+    document.getElementById('timerValue').textContent = formatTime(state.timeRemaining);
 }
 
-.input-icon-wrap .form-control {
-    padding-left: 38px;
+function playBeep(freq, volume) {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = freq;
+        gain.gain.value = volume;
+        osc.start();
+        osc.stop(ctx.currentTime + 0.3);
+    } catch { }
 }
 
-.input-icon-wrap .eye-toggle {
-    position: absolute;
-    right: 10px;
-    top: 50%;
-    transform: translateY(-50%);
-    background: none;
-    border: none;
-    font-size: 16px;
-    cursor: pointer;
-    color: #9E9E9E;
-    padding: 4px;
+// ─── PER-QUESTION TIMER ───────────────────────────────────────────────────────
+function startQTimer() {
+    state.qTimerSeconds = 0;
+    if (qTimerInterval) clearInterval(qTimerInterval);
+    qTimerInterval = setInterval(() => {
+        state.qTimerSeconds++;
+        const el = document.getElementById('qTimer');
+        if (el) el.textContent = '⏱ ' + formatTime(state.qTimerSeconds).slice(3); // MM:SS
+    }, 1000);
 }
 
-/* ─── DOB FIELDS ─── */
-.dob-wrap {
-    display: grid;
-    grid-template-columns: 1fr 1fr 1.3fr;
-    gap: 8px;
+// ─── SUBMIT ───────────────────────────────────────────────────────────────────
+function confirmSubmit() {
+    // Calculate current summary
+    let answered = 0, notAnswered = 0, marked = 0, notVisited = 0;
+    Object.values(state.answers).forEach(a => {
+        const cls = getPaletteClass(a.status, a.markedForReview, a.selectedAnswer);
+        if (cls === 'p-answered' || cls === 'p-answered-marked') answered++;
+        else if (cls === 'p-not-answered') notAnswered++;
+        else if (cls === 'p-marked-no-ans') marked++;
+        else notVisited++;
+    });
+    document.getElementById('modalAnswered').textContent = answered;
+    document.getElementById('modalNotAnswered').textContent = notAnswered;
+    document.getElementById('modalMarked').textContent = marked;
+    document.getElementById('modalNotVisited').textContent = notVisited;
+    document.getElementById('submitModal').classList.add('active');
 }
 
-/* ─── TERMS CHECKBOX ─── */
-.terms-check {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    margin: 16px 0;
-    padding: 12px;
-    background: #F8F9FF;
-    border: 1px solid #D0DAF5;
-    border-radius: 6px;
+function closeSubmitModal() {
+    document.getElementById('submitModal').classList.remove('active');
 }
 
-.terms-check input[type="checkbox"] {
-    width: 16px;
-    height: 16px;
-    min-width: 16px;
-    margin-top: 2px;
-    accent-color: var(--nta-navy);
-    cursor: pointer;
+function finalSubmit() {
+    if (state.submitted) return;
+    state.submitted = true;
+    closeSubmitModal();
+
+    // Stop timers
+    clearInterval(timerInterval);
+    clearInterval(qTimerInterval);
+    clearInterval(autoSaveInterval);
+
+    // Save final Q time
+    const currentQ = state.questions[state.currentIndex];
+    if (currentQ) {
+        state.answers[currentQ.id].timeSpent += state.qTimerSeconds;
+    }
+
+    // Calculate score
+    const scoreData = calculateScore(state.questions, state.answers);
+    const percentile = calculatePercentile(scoreData.netScore, state.testId);
+
+    // Store result
+    const result = {
+        sessionId: state.sessionId,
+        testId: state.testId,
+        userId: state.user.rollNumber,
+        userName: state.user.name,
+        testTitle: state.test.title,
+        attemptNumber: state.attemptNumber,
+        startedAt: state.startedAt,
+        calculatedAt: nowISO(),
+        ...scoreData,
+        percentile,
+        timeRemaining: state.timeRemaining,
+        answers: state.answers,
+        questions: state.questions,
+    };
+
+    // Save to allScores
+    const allScores = Store.get('allScores', []);
+    allScores.push(result);
+    Store.set('allScores', allScores);
+
+    // Save result for result page
+    Store.set('lastResult', result);
+
+    // Clear active session
+    Store.remove(`session_${state.user.rollNumber}_${state.testId}`);
+
+    // Redirect
+    window.location.href = 'result.html';
 }
 
-.terms-check label {
-    font-size: 12px;
-    color: #424242;
-    line-height: 1.5;
-    cursor: pointer;
+// ─── SESSION PERSISTENCE ─────────────────────────────────────────────────────
+function saveSession() {
+    if (state.submitted) return;
+    Store.set(`session_${state.user.rollNumber}_${state.testId}`, {
+        ...state,
+        // Don't serialize heavy data redundantly
+        qTimerSeconds: state.qTimerSeconds,
+    });
 }
 
-.terms-check label a {
-    color: var(--nta-navy);
-}
+// ─── FONT SIZE RESTORE ────────────────────────────────────────────────────────
+const savedFontSize = Store.get('fontSize', 'medium');
+document.body.classList.add(`font-${savedFontSize}`);
+async function fetchLiveQuestions(testId) {
+    if (!window.firebaseDB) return null;
+    console.log(`☁️ Fetching live questions for ${testId}...`);
+    try {
+        const snap = await window.firebaseDB.collection('test_content')
+            .where('testId', '==', testId)
+            .get();
+        if (snap.empty) return null;
 
-/* ─── LOGIN BUTTON ─── */
-.btn-login {
-    width: 100%;
-    padding: 13px;
-    background: var(--nta-navy);
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    font-size: 15px;
-    font-weight: 700;
-    letter-spacing: 1px;
-    cursor: pointer;
-    transition: all 0.2s;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-}
-
-.btn-login:hover:not(:disabled) {
-    background: var(--nta-navy-light);
-    box-shadow: 0 4px 12px rgba(0, 48, 135, 0.3);
-    transform: translateY(-1px);
-}
-
-.btn-login:disabled {
-    background: #BDBDBD;
-    cursor: not-allowed;
-    transform: none;
-}
-
-/* ─── ERROR ALERT ─── */
-.login-error {
-    background: #FFEBEE;
-    border: 1px solid #FFCDD2;
-    border-left: 4px solid #F44336;
-    border-radius: 4px;
-    padding: 10px 14px;
-    margin-bottom: 16px;
-    font-size: 13px;
-    color: #B71C1C;
-    display: none;
-    align-items: center;
-    gap: 8px;
-}
-
-.login-error.show {
-    display: flex;
-}
-
-/* ─── FORGOT LINK ─── */
-.forgot-link {
-    text-align: right;
-    margin-top: 8px;
-}
-
-.forgot-link a {
-    font-size: 12px;
-    color: var(--nta-navy);
-}
-
-/* ─── DEMO CREDENTIALS BOX ─── */
-.demo-box {
-    margin-top: 16px;
-    padding: 10px 14px;
-    background: #FFF8E1;
-    border: 1px solid #FFD54F;
-    border-radius: 6px;
-    font-size: 12px;
-    color: #5D4037;
-}
-
-.demo-box strong {
-    color: #E65100;
-    display: block;
-    margin-bottom: 4px;
-}
-
-.demo-box code {
-    background: #fff;
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 11px;
-}
-
-/* ─── FOOTER ─── */
-.login-footer {
-    background: rgba(0, 0, 0, 0.35);
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 14px 24px;
-    text-align: center;
-}
-
-.login-footer p {
-    color: rgba(255, 255, 255, 0.5);
-    font-size: 11px;
-    line-height: 1.7;
-}
-
-.login-footer .nic-credit {
-    color: rgba(255, 255, 255, 0.35);
-    font-size: 10px;
-    margin-top: 4px;
-}
-
-.login-footer a {
-    color: var(--nta-saffron);
-}
-
-/* ─── LOADING SPINNER ─── */
-.spinner {
-    width: 16px;
-    height: 16px;
-    border: 2px solid rgba(255, 255, 255, 0.3);
-    border-top-color: #fff;
-    border-radius: 50%;
-    animation: spin 0.6s linear infinite;
-    display: inline-block;
+        return snap.docs.map(doc => doc.data()).sort((a, b) => a.questionNumber - b.questionNumber);
+    } catch (err) {
+        console.error('❌ Cloud fetch failed:', err);
+        return null;
+    }
 }
